@@ -1,15 +1,11 @@
-// api/verify.js - 纯内存版（无依赖，最稳定）
-const db = {
-    "BS58-VIP-2024": { exp: 9999999999, maxDevices: 2, devices: [] },
-    "TEST-001": { exp: 9999999999, maxDevices: 1, devices: [] },
-    "免费测试": { exp: 9999999999, maxDevices: 5, devices: [] }
-};
+// api/verify.js - 使用Vercel KV（正确版）
+// 注意：必须用 import 语法，且确保环境变量已设置
 
-module.exports = async function handler(req, res) {
-    // 跨域设置
+import { kv } from '@vercel/kv';
+
+export default async function handler(req, res) {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
     
     if (req.method === 'OPTIONS') return res.status(200).end();
     if (req.method !== 'POST') return res.status(405).json({ error: '仅支持POST' });
@@ -18,107 +14,53 @@ module.exports = async function handler(req, res) {
         const { action, key, hwid } = req.body || {};
         
         if (!key || !hwid) {
-            return res.json({ valid: false, msg: '缺少key或hwid参数' });
+            return res.json({ valid: false, msg: '缺少参数' });
         }
 
-        const keyData = db[key];
+        // 从Redis读取，如果不存在返回null
+        let keyData = await kv.get(`auth:${key}`);
         
-        // 卡密不存在
+        // 初始化新卡密
         if (!keyData) {
-            return res.json({ valid: false, msg: '卡密不存在' });
-        }
-
-        // 检查过期（时间戳对比）
-        const now = Math.floor(Date.now() / 1000);
-        if (now > keyData.exp) {
-            return res.json({ valid: false, msg: '卡密已过期' });
-        }
-
-        // 验证操作
-        if (action === 'verify') {
-            const isBound = keyData.devices.includes(hwid);
+            const presetKeys = {
+                "BS58-VIP-2024": { exp: 9999999999, maxDevices: 2 },
+                "TEST-001": { exp: 9999999999, maxDevices: 1 },
+                "永久卡密-ABC": { exp: 9999999999, maxDevices: 3 }
+            };
             
-            if (isBound) {
-                return res.json({ 
-                    valid: true, 
-                    msg: '验证通过',
-                    deviceNum: keyData.devices.length,
-                    maxDevices: keyData.maxDevices
-                });
-            } else if (keyData.devices.length < keyData.maxDevices) {
-                return res.json({ 
-                    valid: false, 
-                    msg: '未绑定此设备', 
-                    canBind: true,
-                    currentDevices: keyData.devices.length,
-                    maxDevices: keyData.maxDevices
-                });
+            if (presetKeys[key]) {
+                keyData = { ...presetKeys[key], devices: [] };
+                await kv.set(`auth:${key}`, keyData);
             } else {
-                return res.json({ 
-                    valid: false, 
-                    msg: `已达到最大绑定数(${keyData.maxDevices}台)` 
-                });
+                return res.json({ valid: false, msg: '卡密不存在' });
             }
         }
-        
-        // 绑定操作
-        else if (action === 'bind') {
-            // 已绑定
+
+        // 验证
+        if (action === 'verify') {
             if (keyData.devices.includes(hwid)) {
-                return res.json({ 
-                    success: true, 
-                    msg: '设备已绑定',
-                    deviceNum: keyData.devices.length 
-                });
+                return res.json({ valid: true, msg: '验证通过', deviceNum: keyData.devices.length });
+            } else if (keyData.devices.length < keyData.maxDevices) {
+                return res.json({ valid: false, canBind: true, msg: '未绑定' });
+            } else {
+                return res.json({ valid: false, msg: `已达上限(${keyData.maxDevices}台)` });
             }
-            
-            // 设备数已满
+        }
+        
+        // 绑定
+        if (action === 'bind') {
             if (keyData.devices.length >= keyData.maxDevices) {
-                return res.json({ 
-                    success: false, 
-                    msg: `绑定失败，已达上限(${keyData.maxDevices}台)` 
-                });
+                return res.json({ success: false, msg: '设备数已满' });
             }
-            
-            // 执行绑定
             keyData.devices.push(hwid);
-            
-            return res.json({ 
-                success: true, 
-                msg: '绑定成功', 
-                deviceNum: keyData.devices.length,
-                maxDevices: keyData.maxDevices
-            });
+            await kv.set(`auth:${key}`, keyData);
+            return res.json({ success: true, msg: '绑定成功', deviceNum: keyData.devices.length });
         }
         
-        // 解绑操作（可选）
-        else if (action === 'unbind') {
-            keyData.devices = keyData.devices.filter(d => d !== hwid);
-            return res.json({ 
-                success: true, 
-                msg: '解绑成功',
-                remaining: keyData.devices.length 
-            });
-        }
-        
-        // 查询操作（可选）
-        else if (action === 'info') {
-            return res.json({
-                key: key,
-                maxDevices: keyData.maxDevices,
-                currentDevices: keyData.devices.length,
-                devices: keyData.devices, // 返回所有设备ID（调试用）
-                exp: keyData.exp
-            });
-        }
-        
-        return res.json({ error: '未知操作类型' });
+        return res.json({ error: '未知操作' });
         
     } catch (error) {
-        console.error('服务器错误:', error);
-        return res.status(500).json({ 
-            error: '服务器内部错误', 
-            msg: error.message 
-        });
+        console.error('Redis错误:', error);
+        return res.status(500).json({ error: '数据库错误', msg: error.message });
     }
-};
+}
