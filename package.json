@@ -1,6 +1,8 @@
 {
+  "name": "roblox-auth",
+  "version": "1.0.0",
   "type": "module",
   "dependencies": {
-    "@upstash/redis": "^1.0.0"
+    "@upstash/redis": "^1.28.0"
   }
 }
