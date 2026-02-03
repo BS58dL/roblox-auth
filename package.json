@@ -1,5 +1,6 @@
 {
-  "name": "roblox-auth",
-  "version": "1.0.0",
-  "dependencies": {}
+  "type": "module",
+  "dependencies": {
+    "@vercel/kv": "^1.0.0"
+  }
 }
