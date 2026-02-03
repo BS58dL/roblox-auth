@@ -1,16 +1,39 @@
 import { Redis } from '@upstash/redis';
 const redis = Redis.fromEnv();
 
-// 管理密码（自己设置一个复杂的）
+// 管理密码（硬编码，不再依赖环境变量）
 const ADMIN_PASSWORD = 'BS58Admin888!';
+
+// 默认卡密（首次启动时自动创建，防止 locked out）
+const DEFAULT_KEYS = {
+    "BS58-VIP-2024": { maxDevices: 2 },
+    "TEST-001": { maxDevices: 1 }
+};
 
 export default async function handler(req, res) {
     res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    
     if (req.method === 'OPTIONS') return res.status(200).end();
     if (req.method !== 'POST') return res.status(405).end();
 
     try {
-        const { action, key, hwid, adminKey, maxDevices = 2 } = req.body;
+        const { action, key, hwid, adminKey, maxDevices = 2 } = req.body || {};
+
+        // ========== 初始化默认卡密（仅首次）==========
+        if (action === 'init_defaults') {
+            for (const [k, v] of Object.entries(DEFAULT_KEYS)) {
+                const exists = await redis.get(`key:${k}`);
+                if (!exists) {
+                    await redis.set(`key:${k}`, {
+                        devices: [],
+                        maxDevices: v.maxDevices,
+                        created: Date.now()
+                    });
+                }
+            }
+            return res.json({ success: true, msg: '默认卡密已初始化' });
+        }
 
         // ========== 管理接口：添加卡密 ==========
         if (action === 'admin_add') {
@@ -20,11 +43,6 @@ export default async function handler(req, res) {
             
             if (!key) return res.json({ success: false, msg: '缺少卡密' });
             
-            // 检查是否已存在
-            const exists = await redis.get(`key:${key}`);
-            if (exists) return res.json({ success: false, msg: '卡密已存在' });
-            
-            // 添加到Redis
             await redis.set(`key:${key}`, {
                 devices: [],
                 maxDevices: parseInt(maxDevices) || 2,
@@ -44,21 +62,22 @@ export default async function handler(req, res) {
                 return res.json({ success: false, msg: '管理密码错误' });
             }
             
-            // 获取所有卡密（Upstash支持keys命令）
             const keys = await redis.keys('key:*');
             const list = [];
             
             for (const k of keys) {
                 const data = await redis.get(k);
-                list.push({
-                    key: k.replace('key:', ''),
-                    devices: data.devices.length,
-                    maxDevices: data.maxDevices,
-                    created: new Date(data.created).toLocaleString()
-                });
+                if (data) {
+                    list.push({
+                        key: k.replace('key:', ''),
+                        boundDevices: data.devices.length,
+                        maxDevices: data.maxDevices,
+                        created: new Date(data.created).toLocaleString()
+                    });
+                }
             }
             
-            return res.json({ success: true, data: list });
+            return res.json({ success: true, count: list.length, data: list });
         }
 
         // ========== 管理接口：删除卡密 ==========
@@ -78,33 +97,60 @@ export default async function handler(req, res) {
 
         let keyData = await redis.get(`key:${key}`);
         
-        // 如果没有这个卡密，返回不存在（不再从环境变量读取）
+        // 如果没有这个卡密
         if (!keyData) {
             return res.json({ valid: false, msg: '卡密不存在' });
         }
 
         if (action === 'verify') {
             if (keyData.devices.includes(hwid)) {
-                return res.json({ valid: true, msg: '验证通过' });
+                return res.json({ 
+                    valid: true, 
+                    msg: '验证通过',
+                    deviceNum: keyData.devices.length 
+                });
             } else if (keyData.devices.length < keyData.maxDevices) {
-                return res.json({ valid: false, canBind: true, msg: '未绑定' });
+                return res.json({ 
+                    valid: false, 
+                    canBind: true, 
+                    msg: '未绑定此设备',
+                    currentDevices: keyData.devices.length,
+                    maxDevices: keyData.maxDevices
+                });
             } else {
-                return res.json({ valid: false, msg: `已达上限(${keyData.maxDevices}台)` });
+                return res.json({ 
+                    valid: false, 
+                    msg: `已达到最大绑定数(${keyData.maxDevices}台)` 
+                });
             }
         }
         
         if (action === 'bind') {
+            if (keyData.devices.includes(hwid)) {
+                return res.json({ success: true, msg: '设备已绑定' });
+            }
+            
             if (keyData.devices.length >= keyData.maxDevices) {
                 return res.json({ success: false, msg: '设备数已满' });
             }
+            
             keyData.devices.push(hwid);
             await redis.set(`key:${key}`, keyData);
-            return res.json({ success: true, msg: '绑定成功' });
+            
+            return res.json({ 
+                success: true, 
+                msg: '绑定成功', 
+                deviceNum: keyData.devices.length 
+            });
         }
         
         return res.json({ error: '未知操作' });
         
     } catch (error) {
-        return res.status(500).json({ error: error.message });
+        console.error('服务器错误:', error);
+        return res.status(500).json({ 
+            error: '服务器错误', 
+            msg: error.message 
+        });
     }
 }
