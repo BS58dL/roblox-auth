@@ -19,25 +19,45 @@ export default async function handler(req, res) {
 
   try {
     const data = req.method === 'GET' ? req.query : req.body;
-    const { action, key, keys, hwid, adminKey, maxDevices = 2 } = data || {};
+    const { action, key, keys, hwid, adminKey, maxDevices = 2, expireDays = 30 } = data || {};
 
-    // ========== 批量添加卡密 ==========
+    // ========== 初始化默认卡密 ==========
+    if (action === 'init') {
+      const defaultKeys = {
+        "BS58-VIP-2024": { maxDevices: 2, expireDays: 30 },
+        "TEST-001": { maxDevices: 1, expireDays: 7 }
+      };
+      
+      for (const [k, v] of Object.entries(defaultKeys)) {
+        const exists = await redis.get(`key:${k}`);
+        if (!exists) {
+          const expireAt = v.expireDays === 0 ? null : Date.now() + (v.expireDays * 86400000);
+          await redis.set(`key:${k}`, {
+            devices: [],
+            maxDevices: v.maxDevices,
+            created: Date.now(),
+            expireAt: expireAt
+          });
+        }
+      }
+      return res.json({ success: true, msg: '初始化完成' });
+    }
+
+    // ========== 管理：添加卡密（支持有效期） ==========
     if (action === 'admin_add') {
       if (adminKey !== ADMIN_PASSWORD) {
         return res.json({ success: false, msg: '管理密码错误' });
       }
       
-      // 支持单条或批量：key 或 keys 数组
       const keyList = keys || (key ? [key] : []);
+      if (!keyList.length) return res.json({ success: false, msg: '缺少卡密' });
       
-      if (!keyList.length) {
-        return res.json({ success: false, msg: '缺少卡密参数(key或keys)' });
-      }
+      // expireDays: 0=永久, 1=1天, 7=7天, 30=30天, 365=年卡
+      const expireAt = parseInt(expireDays) === 0 ? null : Date.now() + (parseInt(expireDays) * 86400000);
       
       const results = [];
       const errors = [];
       
-      // 并发处理
       await Promise.all(keyList.map(async (k) => {
         try {
           const exists = await redis.get(`key:${k}`);
@@ -49,10 +69,11 @@ export default async function handler(req, res) {
           await redis.set(`key:${k}`, {
             devices: [],
             maxDevices: parseInt(maxDevices) || 2,
-            created: Date.now()
+            created: Date.now(),
+            expireAt: expireAt
           });
           
-          results.push(k);
+          results.push({ key: k, expireAt: expireAt });
         } catch (e) {
           errors.push({ key: k, msg: e.message });
         }
@@ -66,23 +87,49 @@ export default async function handler(req, res) {
       });
     }
 
-    // ========== 批量删除卡密 ==========
+    // ========== 管理：查看所有卡密 ==========
+    if (action === 'admin_list') {
+      if (adminKey !== ADMIN_PASSWORD) {
+        return res.json({ success: false, msg: '管理密码错误' });
+      }
+      
+      const keys = await redis.keys('key:*');
+      const list = [];
+      
+      for (const k of keys) {
+        const data = await redis.get(k);
+        if (data) {
+          const isExpired = data.expireAt && Date.now() > data.expireAt;
+          const remainingDays = data.expireAt ? 
+            Math.ceil((data.expireAt - Date.now()) / 86400000) : 
+            (data.expireAt === null ? -1 : 0); // -1表示永久
+          
+          list.push({
+            key: k.replace('key:', ''),
+            boundDevices: data.devices?.length || 0,
+            maxDevices: data.maxDevices,
+            created: data.created,
+            expireAt: data.expireAt,
+            isExpired: isExpired,
+            remainingDays: remainingDays
+          });
+        }
+      }
+      
+      return res.json({ success: true, count: list.length, data: list });
+    }
+
+    // ========== 管理：删除卡密 ==========
     if (action === 'admin_del') {
       if (adminKey !== ADMIN_PASSWORD) {
         return res.json({ success: false, msg: '管理密码错误' });
       }
       
-      // 支持单条或批量
       const keyList = keys || (key ? [key] : []);
+      if (!keyList.length) return res.json({ success: false, msg: '缺少卡密' });
       
-      if (!keyList.length) {
-        return res.json({ success: false, msg: '缺少卡密参数(key或keys)' });
-      }
-      
-      // 并发删除
       const deletePromises = keyList.map(k => redis.del(`key:${k}`));
       const results = await Promise.all(deletePromises);
-      
       const deletedCount = results.filter(r => r === 1).length;
       
       return res.json({ 
@@ -94,56 +141,29 @@ export default async function handler(req, res) {
       });
     }
 
-    // ========== 管理：查看所有卡密 ==========
-    if (action === 'admin_list') {
+    // ========== 管理：修改卡密有效期 ==========
+    if (action === 'admin_set_expire') {
       if (adminKey !== ADMIN_PASSWORD) {
         return res.json({ success: false, msg: '管理密码错误' });
       }
       
-      const redisKeys = await redis.keys('key:*');
-      const list = [];
+      if (!key) return res.json({ success: false, msg: '缺少卡密' });
       
-      // 批量获取，减少请求次数
-      if (redisKeys.length > 0) {
-        const values = await redis.mget(...redisKeys);
-        
-        redisKeys.forEach((k, index) => {
-          const data = values[index];
-          if (data) {
-            list.push({
-              key: k.replace('key:', ''),
-              boundDevices: data.devices?.length || 0,
-              maxDevices: data.maxDevices,
-              created: data.created
-            });
-          }
-        });
-      }
+      const keyData = await redis.get(`key:${key}`);
+      if (!keyData) return res.json({ success: false, msg: '卡密不存在' });
       
-      return res.json({ success: true, count: list.length, data: list });
+      const newExpireAt = parseInt(expireDays) === 0 ? null : Date.now() + (parseInt(expireDays) * 86400000);
+      keyData.expireAt = newExpireAt;
+      await redis.set(`key:${key}`, keyData);
+      
+      return res.json({ 
+        success: true, 
+        msg: `已修改有效期`,
+        expireAt: newExpireAt
+      });
     }
 
-    // ========== 初始化默认卡密 ==========
-    if (action === 'init') {
-      const defaultKeys = {
-        "BS58-VIP-2024": { maxDevices: 2 },
-        "TEST-001": { maxDevices: 1 }
-      };
-      
-      for (const [k, v] of Object.entries(defaultKeys)) {
-        const exists = await redis.get(`key:${k}`);
-        if (!exists) {
-          await redis.set(`key:${k}`, {
-            devices: [],
-            maxDevices: v.maxDevices,
-            created: Date.now()
-          });
-        }
-      }
-      return res.json({ success: true, msg: '初始化完成' });
-    }
-
-    // ========== 普通验证 ==========
+    // ========== 普通验证（检查过期） ==========
     if (!key || !hwid) {
       return res.json({ valid: false, msg: '缺少key或hwid参数' });
     }
@@ -154,9 +174,22 @@ export default async function handler(req, res) {
       return res.json({ valid: false, msg: '卡密不存在' });
     }
 
+    // 检查是否过期
+    if (keyData.expireAt && Date.now() > keyData.expireAt) {
+      return res.json({ valid: false, msg: '卡密已过期', expired: true });
+    }
+
     if (action === 'verify') {
       if (keyData.devices?.includes(hwid)) {
-        return res.json({ valid: true, msg: '验证通过' });
+        // 计算剩余天数
+        const remainingDays = keyData.expireAt ? 
+          Math.ceil((keyData.expireAt - Date.now()) / 86400000) : -1;
+        return res.json({ 
+          valid: true, 
+          msg: '验证通过',
+          expireAt: keyData.expireAt,
+          remainingDays: remainingDays
+        });
       } else if (keyData.devices.length < keyData.maxDevices) {
         return res.json({ valid: false, canBind: true, msg: '未绑定' });
       } else {
